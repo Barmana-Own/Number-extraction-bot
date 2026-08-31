@@ -17,6 +17,7 @@ import csv
 import datetime as dt
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -25,7 +26,7 @@ import time
 from dataclasses import dataclass
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
@@ -33,13 +34,31 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 ROOT = Path(__file__).resolve().parent
 PRODUCTS_FILE = ROOT / "products.json"
 DEFAULT_OUTPUT = ROOT / "output"
-API_BASE = "https://apishop.irancell.ir"
-SHOP_ORIGIN = "https://shop.irancell.ir"
+API_BASE = os.environ.get("IRANCELL_API_BASE_URL", "https://apishop.irancell.ir").rstrip("/")
+SHOP_ORIGIN = os.environ.get("IRANCELL_SHOP_ORIGIN", "https://shop.irancell.ir").rstrip("/")
 SEARCH_PATH = "/shop/api/v2/search_msisdns"
 PRODUCT_PATH = "/shop/api/v2/get_product_by_id"
 NUMBER_DIGITS = 10
 DEFAULT_QUERY_CAP = 100
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+ExtractionEvent = Callable[[str, dict[str, Any]], None]
+
+
+def emit_event(callback: ExtractionEvent | None, event: str, **payload: Any) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event, payload)
+    except Exception:
+        # Observability must never corrupt the resumable extraction state.
+        logging.debug("extraction event callback failed", exc_info=True)
+
+
+def normalize_bot_prefix(value: str) -> str:
+    digits = normalize_digits(str(value))
+    if len(digits) == 4 and digits.startswith("0"):
+        return digits[1:]
+    return digits
 
 
 def now_utc() -> str:
@@ -126,12 +145,14 @@ class ApiClient:
         retry_forever_on_429: bool = False,
         rate_limit_cooldown: float = 600.0,
         timeout: float = 45.0,
+        event_callback: ExtractionEvent | None = None,
     ) -> None:
         self.delay = max(0.0, delay)
         self.max_retries = max(0, max_retries)
         self.retry_forever_on_429 = retry_forever_on_429
         self.rate_limit_cooldown = max(1.0, rate_limit_cooldown)
         self.timeout = timeout
+        self.event_callback = event_callback
         self.last_request_at = 0.0
         self.cookies = CookieJar()
         self.opener = build_opener(HTTPCookieProcessor(self.cookies))
@@ -190,6 +211,7 @@ class ApiClient:
             except (URLError, TimeoutError, OSError) as exc:
                 if attempt < self.max_retries:
                     wait = self._retry_after({}, attempt, rate_limited=False)
+                    emit_event(self.event_callback, "on_error", message=str(exc), retryable=True, retry_in_seconds=wait)
                     logging.warning("ارتباط با API قطع شد؛ تلاش مجدد در %.1f ثانیه: %s", wait, exc)
                     time.sleep(wait)
                     attempt += 1
@@ -212,6 +234,10 @@ class ApiClient:
                 can_retry = attempt < self.max_retries or (self.retry_forever_on_429 and rate_limited)
                 if can_retry:
                     wait = self._retry_after(response_headers, attempt, rate_limited=rate_limited)
+                    if rate_limited:
+                        emit_event(self.event_callback, "on_rate_limited", status=status, code=code, retry_in_seconds=wait, attempt=attempt + 1)
+                    else:
+                        emit_event(self.event_callback, "on_error", status=status, code=code, retryable=True, retry_in_seconds=wait, attempt=attempt + 1)
                     logging.warning(
                         "API محدود/موقتاً ناموفق بود (HTTP %s، کد %s)؛ تلاش مجدد در %.1f ثانیه%s",
                         status,
@@ -298,18 +324,32 @@ class ProductStore:
         )
         self.db.commit()
 
-    def ensure_roots(self, prefixes: Iterable[str], suffix_length: int) -> None:
+    def ensure_roots(self, prefixes: Iterable[str], suffix_length: int, start_tail: str | None = None) -> None:
         for prefix in prefixes:
+            tail = re.sub(r"\D", "", str(start_tail or ""))
+            if tail and len(tail) <= suffix_length:
+                pattern = prefix + tail + ("*" * (suffix_length - len(tail)))
+            else:
+                pattern = prefix + ("*" * suffix_length)
             self.db.execute(
                 "INSERT OR IGNORE INTO patterns(prefix, pattern) VALUES(?, ?)",
-                (prefix, prefix + ("*" * suffix_length)),
+                (prefix, pattern),
             )
         self.db.commit()
 
-    def claim_next(self) -> sqlite3.Row | None:
+    def claim_next(self, prefix: str | None = None, pattern_startswith: str | None = None) -> sqlite3.Row | None:
+        conditions = ["status='pending'"]
+        params: list[Any] = []
+        if prefix:
+            conditions.append("prefix=?")
+            params.append(prefix)
+        if pattern_startswith:
+            conditions.append("pattern LIKE ?")
+            params.append(pattern_startswith + "%")
         row = self.db.execute(
             "SELECT id, prefix, pattern, attempts FROM patterns "
-            "WHERE status='pending' ORDER BY id LIMIT 1"
+            f"WHERE {' AND '.join(conditions)} ORDER BY id LIMIT 1",
+            tuple(params),
         ).fetchone()
         if row is None:
             return None
@@ -373,14 +413,33 @@ class ProductStore:
         )
         self.db.commit()
 
-    def pending_count(self) -> int:
-        row = self.db.execute(
+    def pending_count(self, prefix: str | None = None) -> int:
+        if prefix:
+            row = self.db.execute(
+                "SELECT COUNT(*) AS count FROM patterns WHERE status IN ('pending', 'in_progress') AND prefix=?",
+                (prefix,),
+            ).fetchone()
+        else:
+            row = self.db.execute(
             "SELECT COUNT(*) AS count FROM patterns WHERE status IN ('pending', 'in_progress')"
-        ).fetchone()
+            ).fetchone()
         return int(row["count"])
 
-    def number_count(self) -> int:
-        row = self.db.execute("SELECT COUNT(*) AS count FROM numbers").fetchone()
+    def scanned_count(self, prefix: str | None = None) -> int:
+        if prefix:
+            row = self.db.execute(
+                "SELECT COUNT(*) AS count FROM patterns WHERE status='done' AND prefix=?",
+                (prefix,),
+            ).fetchone()
+        else:
+            row = self.db.execute("SELECT COUNT(*) AS count FROM patterns WHERE status='done'").fetchone()
+        return int(row["count"])
+
+    def number_count(self, prefix: str | None = None) -> int:
+        if prefix:
+            row = self.db.execute("SELECT COUNT(*) AS count FROM numbers WHERE prefix=?", (prefix,)).fetchone()
+        else:
+            row = self.db.execute("SELECT COUNT(*) AS count FROM numbers").fetchone()
         return int(row["count"])
 
     def pattern_counts(self) -> dict[str, int]:
@@ -459,12 +518,31 @@ def product_directory(output_root: Path, product: ProductConfig) -> Path:
     return output_root / f"{product.id}_{product.slug}"
 
 
+def local_number_count(output_root: Path, product: ProductConfig, prefix: str | None = None) -> int:
+    """Read the resumable local count without starting an extraction request."""
+    directory = product_directory(output_root, product)
+    if not (directory / "state.sqlite3").exists():
+        return 0
+    store = ProductStore(directory)
+    try:
+        return store.number_count(normalize_bot_prefix(prefix) if prefix else None)
+    finally:
+        store.close()
+
+
 def extract_product(
     client: ApiClient,
     product: ProductConfig,
     *,
     output_root: Path,
     max_requests: int,
+    prefix_filter: str | None = None,
+    start_tail: str = "",
+    max_numbers: int = 0,
+    should_stop: Callable[[], str | bool] | None = None,
+    on_event: ExtractionEvent | None = None,
+    baseline_number_count: int | None = None,
+    request_offset: int = 0,
 ) -> dict[str, Any]:
     directory = product_directory(output_root, product)
     store = ProductStore(directory)
@@ -472,6 +550,12 @@ def extract_product(
     request_count = 0
     metadata: dict[str, Any] | None = None
     status = "running"
+    result: dict[str, Any] | None = None
+    requested_prefix = normalize_bot_prefix(prefix_filter) if prefix_filter else None
+    requested_tail = re.sub(r"\D", "", str(start_tail or ""))
+    initial_number_count = 0
+    safe_request_offset = max(0, int(request_offset))
+    emit_event(on_event, "on_started", product_id=product.id, product_name=product.name)
     try:
         metadata = client.get_product(product.id, referer)
         atomic_write_json(directory / "metadata.json", metadata)
@@ -479,9 +563,14 @@ def extract_product(
         store.set_meta("metadata_fetched_at", now_utc())
 
         addons = metadata.get("addons") or []
-        prefixes = [normalize_digits(str(prefix)) for prefix in (metadata.get("prefixes") or [])]
-        prefixes = [prefix for prefix in prefixes if prefix]
+        prefixes = [normalize_bot_prefix(str(prefix)) for prefix in (metadata.get("prefixes") or [])]
+        prefixes = [prefix for prefix in prefixes if re.fullmatch(r"\d{3}", prefix)]
+        if requested_prefix:
+            prefixes = [prefix for prefix in prefixes if normalize_bot_prefix(prefix) == requested_prefix]
+            if not prefixes:
+                raise ApiFailure(f"requested prefix is not available for product {product.id}")
         store.set_meta("prefixes", prefixes)
+        emit_event(on_event, "on_product_started", product_id=product.id, prefixes=prefixes)
 
         if "numberSelection" not in addons or not prefixes:
             status = "skipped_no_number_selection"
@@ -491,7 +580,10 @@ def extract_product(
         suffix_length = NUMBER_DIGITS - len(prefixes[0])
         if suffix_length <= 0 or any(len(prefix) + suffix_length != NUMBER_DIGITS for prefix in prefixes):
             raise ApiFailure(f"prefix length is not compatible with {NUMBER_DIGITS}-digit numbers")
-        store.ensure_roots(prefixes, suffix_length)
+        if len(requested_tail) > suffix_length:
+            raise ApiFailure("requested tail is longer than the available number suffix")
+        store.ensure_roots(prefixes, suffix_length, requested_tail or None)
+        initial_number_count = max(0, int(baseline_number_count)) if baseline_number_count is not None else store.number_count(requested_prefix)
 
         format_pattern = metadata.get("format_pattern")
         logging.info(
@@ -500,11 +592,22 @@ def extract_product(
             ", ".join(prefixes),
         )
         while True:
+            decision = should_stop() if should_stop else False
+            if decision in (True, "stop"):
+                status = "stopped"
+                break
+            if decision == "pause":
+                status = "paused_by_user"
+                break
             if max_requests and request_count >= max_requests:
                 status = "paused_request_limit"
                 logging.info("[%s] سقف درخواست این اجرا رسید؛ دفعه بعد ادامه می‌دهد", product.id)
                 break
-            row = store.claim_next()
+            if max_numbers and store.number_count(requested_prefix) >= max_numbers:
+                status = "target_reached"
+                break
+            pattern_scope = (prefixes[0] + requested_tail) if requested_prefix and requested_tail else None
+            row = store.claim_next(prefix=prefixes[0] if requested_prefix else None, pattern_startswith=pattern_scope)
             if row is None:
                 status = "complete"
                 break
@@ -519,13 +622,26 @@ def extract_product(
                     format_pattern=format_pattern,
                 )
                 store.append_partial(new_values)
+                for number, formatted in new_values:
+                    emit_event(
+                        on_event,
+                        "on_number_found",
+                        product_id=product.id,
+                        prefix=row["prefix"],
+                        pattern=row["pattern"],
+                        number=number,
+                        formatted_number=formatted,
+                    )
 
                 cap = response.get("limit")
                 try:
                     cap = int(cap) if cap else DEFAULT_QUERY_CAP
                 except (TypeError, ValueError):
                     cap = DEFAULT_QUERY_CAP
-                if len(values) >= cap and "*" in row["pattern"]:
+                reached_target = bool(max_numbers and store.number_count(requested_prefix) >= max_numbers)
+                if reached_target:
+                    status = "target_reached"
+                elif len(values) >= cap and "*" in row["pattern"]:
                     child_count = store.add_children(row["prefix"], row["pattern"])
                     logging.debug(
                         "[%s] الگوی %s پر بود؛ %s زیرالگو اضافه شد",
@@ -536,30 +652,47 @@ def extract_product(
                 elif len(values) >= cap and "*" not in row["pattern"]:
                     logging.warning("[%s] الگوی کامل با پاسخ سقف‌خورده برگشت: %s", product.id, row["pattern"])
                 store.mark_done(row["id"], len(values))
+                emit_event(
+                    on_event,
+                    "on_progress",
+                    product_id=product.id,
+                    requests=safe_request_offset + request_count,
+                    scanned_patterns=store.scanned_count(requested_prefix),
+                    pending_patterns=store.pending_count(requested_prefix),
+                    unique_numbers=max(0, store.number_count(requested_prefix) - initial_number_count),
+                    current_pattern=row["pattern"],
+                )
+                if reached_target:
+                    break
                 if request_count == 1 or request_count % 25 == 0:
                     logging.info(
                         "[%s] درخواست %s؛ شماره یکتا: %s؛ الگوهای باقی‌مانده: %s",
                         product.id,
                         request_count,
-                        store.number_count(),
-                        store.pending_count(),
+                        store.number_count(requested_prefix),
+                        store.pending_count(requested_prefix),
                     )
             except Exception as exc:
                 store.requeue(row["id"], str(exc))
+                emit_event(on_event, "on_error", product_id=product.id, pattern=row["pattern"], message=str(exc), retryable=False)
                 raise
 
-        return {
+        result = {
             "product_id": product.id,
             "status": status,
-            "number_count": store.number_count(),
-            "requests": request_count,
-            "pending_patterns": store.pending_count(),
+            "number_count": store.number_count(requested_prefix),
+            "new_number_count": max(0, store.number_count(requested_prefix) - initial_number_count),
+            "requests": safe_request_offset + request_count,
+            "scanned_patterns": store.scanned_count(requested_prefix),
+            "pending_patterns": store.pending_count(requested_prefix),
         }
+        return result
     except KeyboardInterrupt:
         status = "interrupted"
         raise
-    except Exception:
+    except Exception as exc:
         status = "error"
+        emit_event(on_event, "on_error", product_id=product.id, message=str(exc), retryable=isinstance(exc, ApiFailure) and exc.retryable)
         raise
     finally:
         if metadata is None:
@@ -568,6 +701,16 @@ def extract_product(
             store.export(status=status, product=product.__dict__, metadata=metadata)
         finally:
             store.close()
+        emit_event(
+            on_event,
+            "on_completed",
+            product_id=product.id,
+            status=status,
+            number_count=(result or {}).get("number_count", 0),
+            new_number_count=(result or {}).get("new_number_count", 0),
+            requests=(result or {}).get("requests", safe_request_offset + request_count),
+            pending_patterns=(result or {}).get("pending_patterns", 0),
+        )
 
 
 def export_existing(products: list[ProductConfig], output_root: Path) -> None:

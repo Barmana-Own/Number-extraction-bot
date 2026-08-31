@@ -1,6 +1,11 @@
 # Runtime state and extracted phone-number data stay local.
 # Do not publish these files in a public repository.
 output/
+dist/
+build/
+*.spec.bak
+desktop_agent.lock
+runtime/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

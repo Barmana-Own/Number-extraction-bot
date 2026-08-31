@@ -1,3 +1,7 @@
 @echo off
 cd /d "%~dp0"
-python "%~dp0start_extraction.py"
+if exist "%~dp0dist\HamshmarehExtractor.exe" (
+  start "Hamshmareh Extractor" "%~dp0dist\HamshmarehExtractor.exe"
+) else (
+  python "%~dp0start_extraction.py"
+)
