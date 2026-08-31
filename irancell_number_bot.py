@@ -737,19 +737,21 @@ def configure_logging(output_root: Path, verbose: bool) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
     root_logger.handlers.clear()
-    # Windows PowerShell may expose a legacy code page that cannot encode
-    # Persian log messages.  Reconfigure only the text stream used for logs;
-    # all extracted data is written as UTF-8 files regardless of the console.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    configure_console_encoding()
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     root_logger.addHandler(console)
     file_handler = logging.FileHandler(output_root / "run.log", encoding="utf-8")
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
+
+
+def configure_console_encoding() -> None:
+    """Keep CLI help and logs usable on legacy Windows code pages."""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -776,6 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_console_encoding()
     args = build_parser().parse_args()
     products = load_products()
     selected = select_products(products, args.products)

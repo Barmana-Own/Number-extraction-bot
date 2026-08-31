@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from desktop_agent.api_client import AgentApiError, ControlPlaneClient
+from desktop_agent.config import resolve_output_dir
 from desktop_agent.runner import _product_slug
 from desktop_agent.storage import AgentStorage
 
@@ -92,6 +93,24 @@ class DesktopApiSecurityTest(unittest.TestCase):
     def test_existing_bot_product_slug_is_preserved(self):
         self.assertEqual(_product_slug(157, "نام جدید محصول"), "prepaid-basic")
         self.assertEqual(_product_slug(999999, "نام جدید محصول"), "product")
+
+    def test_output_root_reuses_existing_legacy_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_output = root / "project" / "output"
+            state_path = legacy_output / "560_0900-single-star" / "state.sqlite3"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_bytes(b"")
+
+            resolved = resolve_output_dir(
+                data_dir=root / "appdata",
+                project_root=root / "project",
+                cwd=root / "other-working-directory",
+                executable_path=root / "project" / "dist" / "HamshmarehExtractor.exe",
+                frozen=False,
+            )
+
+            self.assertEqual(resolved, legacy_output)
 
 
 if __name__ == "__main__":

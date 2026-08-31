@@ -40,6 +40,8 @@ python .\irancell_number_bot.py --products all --delay 8 --retry-forever-429 --r
 python .\irancell_number_bot.py --products all --export-only
 ```
 
+Desktop Agent نیز هنگام اجرای سورس، state موجود در `output` پروژه را شناسایی و از همان‌جا ادامه می‌دهد؛ بنابراین با تغییر نسخه، شماره‌ها و الگوهای قبلی دوباره از ابتدا شروع نمی‌شوند. در صورت نیاز می‌توان مسیر محلی دیگری را با متغیر محیطی `HAMSHMAREH_OUTPUT_DIR` تعیین کرد. این مسیر باید محلی و قابل‌اعتماد باشد.
+
 ## خروجی و پایداری
 
 برای هر محصول یک پوشهٔ جدا در `output` ساخته می‌شود:

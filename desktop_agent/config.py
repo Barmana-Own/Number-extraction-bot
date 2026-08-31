@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import socket
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -23,8 +24,52 @@ DATA_DIR = default_data_dir()
 SETTINGS_FILE = DATA_DIR / "settings.json"
 TOKEN_FILE = DATA_DIR / "device-token.bin"
 STATE_DB = DATA_DIR / "agent.sqlite3"
-OUTPUT_DIR = DATA_DIR / "extraction"
 LOG_DIR = DATA_DIR / "logs"
+
+
+def _has_extraction_state(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(item.is_file() for item in path.glob("*/state.sqlite3"))
+    except OSError:
+        return False
+
+
+def resolve_output_dir(
+    *,
+    data_dir: Path,
+    project_root: Path,
+    cwd: Path,
+    executable_path: Path,
+    frozen: bool,
+) -> Path:
+    """Select a local output root while preserving the legacy resumable state."""
+    configured = os.environ.get("HAMSHMAREH_OUTPUT_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+
+    candidates: list[Path] = []
+    if not frozen:
+        candidates.append(project_root / "output")
+    candidates.append(cwd / "output")
+    executable_dir = executable_path.parent
+    candidates.append(executable_dir / "output")
+    if frozen:
+        candidates.append(executable_dir.parent / "output")
+
+    for candidate in candidates:
+        if _has_extraction_state(candidate):
+            return candidate
+
+    return data_dir / "extraction" if frozen else project_root / "output"
+
+
+OUTPUT_DIR = resolve_output_dir(
+    data_dir=DATA_DIR,
+    project_root=Path(__file__).resolve().parents[1],
+    cwd=Path.cwd(),
+    executable_path=Path(sys.executable).resolve(),
+    frozen=bool(getattr(sys, "frozen", False)),
+)
 
 
 def _safe_device_name() -> str:
